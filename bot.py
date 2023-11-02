@@ -17,7 +17,7 @@ class ConfessionBot:
     async def message_handler(self, message : discord.Message):
         
         content, files = await self.unpackMessage(message)
-        
+        self.logger.info(f'User {message.author.name} send in a confession with the following content:\n{content}')
         content = f'Confession:\n' + content
         
         channel = self.bot.get_channel(self.channel_id)
@@ -52,13 +52,13 @@ class ConfessionBot:
         @bot.event
         async def on_message(message : discord.Message):
             if isinstance(message.channel, discord.DMChannel) and message.author != bot.user:
-                await self.messageHandler(message)
+                await self.message_handler(message)
         bot.run(self.__bot_token)
     
 
     
 if __name__ == "__main__":
     
-    bot = ConfessionBot()
-    bot.run_bot(BOT_TOKEN, CHANNEL_ID)
+    bot = ConfessionBot(BOT_TOKEN, CHANNEL_ID)
+    bot.run_bot()
          
