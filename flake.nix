@@ -18,9 +18,12 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs =
-    # `...` rather than a closed { self, nixpkgs }: adding a second input later
-    # would otherwise fail with "called with unexpected argument 'self'".
-    { nixpkgs, ... }:
+    # `self` is named because the anchor below needs it: it is this flake's own
+    # source in the store, which is the only path a wrapper can be sure points at
+    # THIS repo no matter where it was invoked from. `...` rather than a closed
+    # { self, nixpkgs }: adding a second input later would otherwise fail with
+    # "called with unexpected argument '<name>'".
+    { self, nixpkgs, ... }:
     let
       lib = nixpkgs.lib;
 
@@ -147,9 +150,13 @@
       #   no `test`  -- there is no test suite, and a stub that echoed
       #                 "not applicable" would turn this map into a liar
       #
-      # `text` is bash under `set -euo pipefail`, shellcheck'd at BUILD time, and
-      # it runs in the caller's current directory so an agent can test
-      # uncommitted edits.
+      # `text` is bash under `set -euo pipefail`, shellcheck'd at BUILD time. It
+      # runs in the caller's current directory but must never ACT on it: every
+      # verb below addresses $REPO_ROOT (see the anchor in the generic machinery)
+      # so that `nix run /path/to/repo#<verb>` -- the form CI and a cold agent
+      # use, from whatever cwd they happen to have -- reads and writes exactly
+      # the same files as `dev-<verb>` from inside the tree, and nothing else.
+      # Explicit arguments still win, so an agent can narrow a verb to one file.
       commands = pkgs: {
         run = {
           # (network) twice over: the bot dials the Discord gateway and keeps the
@@ -157,6 +164,11 @@
           # must run it with a timeout and read the log, not wait for exit 0.
           description = "(network) start the confession bot -- needs a local config.py";
           text = ''
+            # This verb reads a gitignored file and writes a log, so the store
+            # fallback is useless to it: refuse rather than tell the caller to
+            # create config.py inside /nix/store.
+            require_worktree
+
             # bot.py does `from config import *` for BOT_TOKEN and CHANNEL_ID,
             # and .gitignore excludes *config*, so a fresh clone has no config.py
             # and the bot dies with a bare ModuleNotFoundError. Fail early with
@@ -168,17 +180,20 @@
               echo "  CHANNEL_ID = <target channel id as an int>" >&2
               exit 1
             fi
-            # Absolute path to the script, not a cd: python puts the script's own
-            # directory first on sys.path, so `config` and `logger` resolve even
-            # when an agent invokes this from a subdirectory. Bare `python3` is
-            # correct here -- the wrappers prepend this flake's toolchain, so it
-            # is the interpreter that has discord.py baked in.
-            #
-            # Deliberately NOT cd'd to $REPO_ROOT, per the house rule that
-            # commands act on the caller's cwd. Consequence to know about:
-            # logger.py builds its log filename with no directory part, so the
-            # baselog_*.txt lands in whatever directory you launched this from.
-            python3 "$REPO_ROOT/bot.py" "$@"
+            # cd, and not merely `python3 "$REPO_ROOT/bot.py"`: logger.py builds
+            # its log filename with no directory part, so the bot OPENS A FILE
+            # FOR WRITING relative to cwd. Without the cd, launching this from
+            # anywhere but the repo root drops a baselog_log_*.txt in the
+            # caller's directory. In $REPO_ROOT it lands on a *baselog* line
+            # already in .gitignore. The cd also puts the script's own directory
+            # first on sys.path, which is what makes `config` and `logger`
+            # importable.
+            cd "$REPO_ROOT"
+            # Bare `python3` is correct here -- the wrappers prepend this flake's
+            # toolchain, so it is the interpreter that has discord.py baked in.
+            # exec so the bot inherits this PID: an agent's `timeout`/SIGTERM
+            # then reaches python itself instead of a shell that outlives it.
+            exec python3 bot.py "$@"
           '';
         };
         lint = {
@@ -190,17 +205,75 @@
           # paper over it with flags baked into this flake, where nothing
           # reading the repo would ever find them.
           description = "ruff check";
-          text = ''ruff check "$@"'';
+          # `"''${@:-$REPO_ROOT}"`, not a bare `"$@"`: with no arguments ruff
+          # walks the cwd, so this verb used to inspect whatever tree the caller
+          # was standing in -- and in an unrelated empty directory it printed
+          # "All checks passed!" and exited 0 while the same command from inside
+          # the repo exited 1 with 25 findings. A gate that passes by inspecting
+          # zero files is worse than no gate. The default also fixes the smaller
+          # version of the same bug inside the repo: run from a subdirectory,
+          # lint now still covers the whole tree.
+          #
+          # `--no-cache` closes the last hole in the same defect: ruff puts
+          # .ruff_cache next to the CWD, not next to the files it was handed, so
+          # even after anchoring the paths, linting from an unrelated directory
+          # littered a cache directory in it. Pointing --cache-dir at $REPO_ROOT
+          # instead does not work in general -- on the store fallback below that
+          # path is read-only and ruff exits 2 with "Failed to initialize cache"
+          # rather than degrading -- and two source files have nothing worth
+          # caching. This is not a rule flag; it does not change a single finding.
+          text = ''ruff check --no-cache "''${@:-$REPO_ROOT}"'';
         };
         fmt = {
           description = "ruff format (rewrites files)";
-          text = ''ruff format "$@"'';
+          text = ''
+            # ruff format MUTATES, so the unanchored version of this verb was the
+            # serious half of that bug: `nix run /path/to/repo#fmt` from anywhere
+            # rewrote the caller's source files. Guard, then default to the repo.
+            # An explicit path is the caller's own decision and passes straight
+            # through -- that is the one case where touching files outside
+            # $REPO_ROOT is exactly what was asked for.
+            if [ "$#" -eq 0 ]; then
+              require_worktree
+            fi
+            # --no-cache for the reason spelled out under lint: the cache lands
+            # beside the cwd, not beside the target.
+            ruff format --no-cache "''${@:-$REPO_ROOT}"
+          '';
         };
       };
 
       # ======================================================================
+      # PER-REPO BLOCK 5 -- how to recognise this repo's work tree
+      # ======================================================================
+      # The anchor below has to tell "the caller is standing in a clone of THIS
+      # repo" from "the caller is standing in some unrelated tree", because
+      # `git rev-parse --show-toplevel` answers for ANY enclosing repo and a
+      # mutating verb pointed at a stranger's toplevel is the exact bug being
+      # fixed. These are paths that exist in every clone of this repo and in no
+      # plausible stranger -- its two source files, which are also its entire
+      # Python surface. ALL of them must be present for a tree to count.
+      #
+      # Deliberately not flake.nix or flake.lock: they are the files most likely
+      # to be mid-edit, and a fingerprint that goes stale while you edit it
+      # would send every verb to the read-only fallback for the rest of the
+      # session. Deliberately not the git remote either -- a clone can be
+      # renamed, re-remoted, or have no remote at all.
+      worktreeMarkers = [
+        "bot.py"
+        "logger.py"
+      ];
+
+      # What to call this repo when a verb has to tell the caller it is standing
+      # in the wrong place. Only ever user-facing text.
+      repoName = "dc-confessions";
+
+      # ======================================================================
       # GENERIC MACHINERY -- byte-identical in every repo in the fleet, do not edit
       # ======================================================================
+      # "Byte-identical" survives the anchor below because the two repo-specific
+      # things it needs -- worktreeMarkers and repoName -- are interpolated from
+      # BLOCK 5 rather than written into the machinery.
 
       # Prepend, never assign: a host LD_LIBRARY_PATH may be carrying something
       # the user needs, and clobbering it breaks binaries they launch from here.
@@ -212,13 +285,59 @@
           export LD_LIBRARY_PATH="${lib.makeLibraryPath (nativeLibs pkgs)}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         '';
 
-      # Every command gets $REPO_ROOT. `nix run` and `nix develop` both start in
-      # whatever directory they were invoked from, so a bare `.venv` silently
-      # forks a second environment as soon as an agent works from a subdirectory.
-      # Note we do NOT cd there: commands act on the caller's cwd on purpose.
+      # THE ANCHOR. Every command gets $REPO_ROOT and every command addresses it
+      # instead of `.`, because `nix run` and `nix develop` both start in whatever
+      # directory they were invoked from -- and the flake-URL form
+      # (`nix run /path/to/repo#fmt`) is what CI and a cold agent use, from a cwd
+      # that has nothing to do with this repo.
+      #
+      # Resolution order, and every branch of it earns its place:
+      #
+      #   1. The caller's git work tree, so uncommitted edits are what gets
+      #      linted -- but only once it identifies as this repo (BLOCK 5). The
+      #      old `|| pwd` fallback is what made the bug reachable: outside a git
+      #      repo it aimed every verb at the caller's directory, and inside an
+      #      unrelated one it aimed them at that project's toplevel.
+      #   2. ${self} -- this flake's own source as nix copied it into the store.
+      #      Always present, always this repo, and read-only. Read-only verbs
+      #      therefore still report the truth about this code from any cwd on the
+      #      filesystem (`nix run /path/to/repo#lint` in /tmp finds the same
+      #      findings and returns the same exit code as it does from the tree),
+      #      and writing verbs hit require_worktree below instead of a stranger's
+      #      files.
+      #
+      # Cost of naming ${self} here, so nobody has to rediscover it: the wrappers
+      # now depend on the source, so editing any tracked file re-realises them on
+      # the next `nix run`. That is three writeShellApplication builds plus their
+      # shellcheck pass, ~1s warm, and it buys the guarantee above.
       rootPreamble = ''
-        REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+        REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+        if [ -z "$REPO_ROOT" ] || ${
+          lib.concatMapStringsSep " || " (m: ''[ ! -e "$REPO_ROOT/${m}" ]'') worktreeMarkers
+        }; then
+          REPO_ROOT="${self}"
+        fi
         export REPO_ROOT
+      '';
+
+      # Defined for every verb, called only by the ones that WRITE, so this rule
+      # exists once instead of once per verb. A $REPO_ROOT under /nix/store means
+      # branch 2 of the anchor fired -- there is no work tree at or above the
+      # caller -- and for a mutating verb that is a refusal, not a fallback.
+      # Without it the caller gets a page of "Permission denied" from a read-only
+      # store path and has to work out why; with it they get told to cd into a
+      # clone. `''${0##*/}` is the wrapper's own name (dev-fmt, dev-run), so the
+      # message names the command the caller actually typed.
+      guardPreamble = ''
+        require_worktree() {
+          case "$REPO_ROOT" in
+            /nix/store/*)
+              echo "''${0##*/}: no ${repoName} work tree at or above $PWD" >&2
+              echo "  cd into a clone (or pass an explicit path) and retry" >&2
+              exit 1
+              ;;
+          esac
+        }
       '';
 
       # One derivation per command, reused by both `apps` and the dev shell, so
@@ -236,6 +355,7 @@
             meta.description = cmd.description;
             text = ''
               ${rootPreamble}
+              ${guardPreamble}
               ${ldPreamble pkgs}
               ${cmd.text}
             '';
