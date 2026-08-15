@@ -1,3 +1,9 @@
 *config*
 *pycache*
 *baselog*
+.venv/
+.direnv/
+.ruff_cache/
+*.pyc
+result
+result-*
