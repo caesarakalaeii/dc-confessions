@@ -157,6 +157,17 @@
       # use, from whatever cwd they happen to have -- reads and writes exactly
       # the same files as `dev-<verb>` from inside the tree, and nothing else.
       # Explicit arguments still win, so an agent can narrow a verb to one file.
+      #
+      # $REPO_ROOT is only ever THIS repo. It used to be "the enclosing git
+      # toplevel, if it holds bot.py and logger.py" -- which the sibling bot
+      # repos this one is usually checked out beside (dc-bot,
+      # dc-ranked_queue) satisfy exactly, both carrying those two names in
+      # their roots. So `nix run /path/to/dc-confessions#lint` from inside
+      # dc-bot reported dc-bot's 61 findings as this repo's, and `#fmt` would
+      # have rewritten dc-bot's sources. The anchor now demands a
+      # byte-identical flake.nix instead of a filename a neighbour can also
+      # own. Do not reintroduce a marker list: this repo's entire Python
+      # surface is two files whose names half the fleet shares.
       commands = pkgs: {
         run = {
           # (network) twice over: the bot dials the Discord gateway and keeps the
@@ -167,7 +178,7 @@
             # This verb reads a gitignored file and writes a log, so the store
             # fallback is useless to it: refuse rather than tell the caller to
             # create config.py inside /nix/store.
-            require_worktree
+            need_writable_checkout
 
             # bot.py does `from config import *` for BOT_TOKEN and CHANNEL_ID,
             # and .gitignore excludes *config*, so a fresh clone has no config.py
@@ -234,7 +245,7 @@
             # through -- that is the one case where touching files outside
             # $REPO_ROOT is exactly what was asked for.
             if [ "$#" -eq 0 ]; then
-              require_worktree
+              need_writable_checkout
             fi
             # --no-cache for the reason spelled out under lint: the cache lands
             # beside the cwd, not beside the target.
@@ -244,36 +255,8 @@
       };
 
       # ======================================================================
-      # PER-REPO BLOCK 5 -- how to recognise this repo's work tree
+      # GENERIC MACHINERY -- byte-identical in all 41 repos, do not edit
       # ======================================================================
-      # The anchor below has to tell "the caller is standing in a clone of THIS
-      # repo" from "the caller is standing in some unrelated tree", because
-      # `git rev-parse --show-toplevel` answers for ANY enclosing repo and a
-      # mutating verb pointed at a stranger's toplevel is the exact bug being
-      # fixed. These are paths that exist in every clone of this repo and in no
-      # plausible stranger -- its two source files, which are also its entire
-      # Python surface. ALL of them must be present for a tree to count.
-      #
-      # Deliberately not flake.nix or flake.lock: they are the files most likely
-      # to be mid-edit, and a fingerprint that goes stale while you edit it
-      # would send every verb to the read-only fallback for the rest of the
-      # session. Deliberately not the git remote either -- a clone can be
-      # renamed, re-remoted, or have no remote at all.
-      worktreeMarkers = [
-        "bot.py"
-        "logger.py"
-      ];
-
-      # What to call this repo when a verb has to tell the caller it is standing
-      # in the wrong place. Only ever user-facing text.
-      repoName = "dc-confessions";
-
-      # ======================================================================
-      # GENERIC MACHINERY -- byte-identical in every repo in the fleet, do not edit
-      # ======================================================================
-      # "Byte-identical" survives the anchor below because the two repo-specific
-      # things it needs -- worktreeMarkers and repoName -- are interpolated from
-      # BLOCK 5 rather than written into the machinery.
 
       # Prepend, never assign: a host LD_LIBRARY_PATH may be carrying something
       # the user needs, and clobbering it breaks binaries they launch from here.
@@ -285,58 +268,60 @@
           export LD_LIBRARY_PATH="${lib.makeLibraryPath (nativeLibs pkgs)}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         '';
 
-      # THE ANCHOR. Every command gets $REPO_ROOT and every command addresses it
-      # instead of `.`, because `nix run` and `nix develop` both start in whatever
-      # directory they were invoked from -- and the flake-URL form
-      # (`nix run /path/to/repo#fmt`) is what CI and a cold agent use, from a cwd
-      # that has nothing to do with this repo.
+      # Every command gets $SRC_ROOT and $REPO_ROOT. `nix run` and `nix develop`
+      # both start in whatever directory they were invoked from, and no verb may
+      # act on that directory -- these two are what it acts on instead.
       #
-      # Resolution order, and every branch of it earns its place:
+      # $SRC_ROOT is this flake's own source, snapshotted into the store when
+      # the flake was evaluated. It is the one anchor that is always available:
+      # `nix run /path/to/repo#lint` tells the running program nothing whatever
+      # about /path/to/repo (flake refs are location-independent by design, and
+      # there is no $FLAKE_DIR to read), so without `self` a wrapper invoked
+      # that way has literally no way to name the repo it belongs to. Its one
+      # limitation is that it is read-only, being a store path.
       #
-      #   1. The caller's git work tree, so uncommitted edits are what gets
-      #      linted -- but only once it identifies as this repo (BLOCK 5). The
-      #      old `|| pwd` fallback is what made the bug reachable: outside a git
-      #      repo it aimed every verb at the caller's directory, and inside an
-      #      unrelated one it aimed them at that project's toplevel.
-      #   2. ${self} -- this flake's own source as nix copied it into the store.
-      #      Always present, always this repo, and read-only. Read-only verbs
-      #      therefore still report the truth about this code from any cwd on the
-      #      filesystem (`nix run /path/to/repo#lint` in /tmp finds the same
-      #      findings and returns the same exit code as it does from the tree),
-      #      and writing verbs hit require_worktree below instead of a stranger's
-      #      files.
+      # $REPO_ROOT is the writable checkout when the caller is standing in one,
+      # and $SRC_ROOT when they are not. `git rev-parse --show-toplevel` alone
+      # is NOT enough to find that checkout: run from inside some OTHER git
+      # repo it cheerfully answers with THAT repo's top level, and a verb that
+      # trusts the answer formats a stranger's source tree. So a candidate has
+      # to prove it is a checkout of this flake, by carrying a byte-identical
+      # flake.nix. Compared with bash's own $(<file) rather than cmp or
+      # sha256sum, so the check depends on no package at all.
       #
-      # Cost of naming ${self} here, so nobody has to rediscover it: the wrappers
-      # now depend on the source, so editing any tracked file re-realises them on
-      # the next `nix run`. That is three writeShellApplication builds plus their
-      # shellcheck pass, ~1s warm, and it buys the guarantee above.
+      # Consequence worth knowing: edit flake.nix and the dev-* wrappers in an
+      # already-open `nix develop` stop recognising the tree, because they were
+      # built from the previous flake.nix. That is a stale shell telling you so
+      # -- re-enter it. `nix run` re-evaluates every time and never sees this.
       rootPreamble = ''
-        REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-        if [ -z "$REPO_ROOT" ] || ${
-          lib.concatMapStringsSep " || " (m: ''[ ! -e "$REPO_ROOT/${m}" ]'') worktreeMarkers
-        }; then
-          REPO_ROOT="${self}"
+        SRC_ROOT=${lib.escapeShellArg self}
+        export SRC_ROOT
+        REPO_ROOT="$SRC_ROOT"
+        _toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+        if [ -n "$_toplevel" ] && [ -f "$_toplevel/flake.nix" ] &&
+          [ "$(<"$_toplevel/flake.nix")" = "$(<"$SRC_ROOT/flake.nix")" ]; then
+          REPO_ROOT="$_toplevel"
         fi
+        unset _toplevel
         export REPO_ROOT
       '';
 
-      # Defined for every verb, called only by the ones that WRITE, so this rule
-      # exists once instead of once per verb. A $REPO_ROOT under /nix/store means
-      # branch 2 of the anchor fired -- there is no work tree at or above the
-      # caller -- and for a mutating verb that is a refusal, not a fallback.
-      # Without it the caller gets a page of "Permission denied" from a read-only
-      # store path and has to work out why; with it they get told to cd into a
-      # clone. `''${0##*/}` is the wrapper's own name (dev-fmt, dev-run), so the
-      # message names the command the caller actually typed.
+      # Wrappers only, not the shellHook -- an interactive shell has no business
+      # carrying this function around. Any command text that writes files calls
+      # it first, and it is the reason a mutating verb can fail loudly instead of
+      # falling back to "well, the cwd then".
       guardPreamble = ''
-        require_worktree() {
-          case "$REPO_ROOT" in
-            /nix/store/*)
-              echo "''${0##*/}: no ${repoName} work tree at or above $PWD" >&2
-              echo "  cd into a clone (or pass an explicit path) and retry" >&2
-              exit 1
-              ;;
-          esac
+        need_writable_checkout() {
+          if [ "$REPO_ROOT" != "$SRC_ROOT" ]; then
+            return 0
+          fi
+          echo "This command rewrites files, so it needs a writable checkout of" >&2
+          echo "this repo -- and standing in $PWD there is none: no parent" >&2
+          echo "directory is a checkout of this flake. The only tree in reach is" >&2
+          echo "the read-only store snapshot $SRC_ROOT, and rewriting $PWD" >&2
+          echo "instead is exactly the bug this guard exists to prevent." >&2
+          echo "cd into the repo (or \`nix develop\` it), or pass an explicit path." >&2
+          exit 1
         }
       '';
 
